@@ -1,0 +1,87 @@
+name: CI/CD Multi-Tenant Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/web-sample:${{ github.sha }}
+  KUBE_NAMESPACE: user1   # override via matrix or workflow_dispatch inputs
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v4
+        with:
+          push: true
+          tags: ${{ env.IMAGE }}
+          file: ./apps/node-sample/Dockerfile
+          context: ./apps/node-sample
+
+      - name: Set output image
+        run: echo "::set-output name=image::${IMAGE}"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      matrix:
+        namespace: [user1, user2, user3]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: '1.27.0'
+
+      - name: Setup Kubeconfig
+        run: |
+          echo "${{ secrets.KUBECONFIG_BASE64 }}" | base64 --decode > kubeconfig
+          export KUBECONFIG="$PWD/kubeconfig"
+
+      - name: Deploy to k8s
+        id: deploy
+        run: |
+          export KUBECONFIG="$PWD/kubeconfig"
+          # replace image and namespace in the template and apply
+          envsubst < k8s/tenant/deployment.yaml | sed "s/namespace: user1/namespace: ${{ matrix.namespace }}/" > /tmp/deployment.yaml
+          kubectl -n ${{ matrix.namespace }} apply -f /tmp/deployment.yaml
+          kubectl -n ${{ matrix.namespace }} set image deployment/web web=${{ needs.build-and-push.outputs.image }}
+          kubectl -n ${{ matrix.namespace }} rollout status deployment/web --timeout=120s
+
+      - name: Verify and publish event
+        id: notify
+        run: |
+          # if rollout not successful - trigger rollback
+          export KUBECONFIG="$PWD/kubeconfig"
+          if ! kubectl -n ${{ matrix.namespace }} rollout status deployment/web --timeout=120s; then
+            echo "Rollout failed. Rolling back..."
+            kubectl -n ${{ matrix.namespace }} rollout undo deployment/web
+            exit 1
+          fi
+
+          # publish a Kafka event using kafkacat docker image (assumes you have KAFKA bootstrap address in secrets)
+          echo '{"event":"WebsiteCreated","tenant":"'"${{ matrix.namespace }}"'","image":"'"${{ needs.build-and-push.outputs.image }}"'"}' > /tmp/event.json
+          docker run --rm edenhill/kafkacat -b ${{ secrets.KAFKA_BOOTSTRAP }} -P -t websites <<EOF
+$(cat /tmp/event.json)
+EOF
